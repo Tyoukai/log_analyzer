@@ -84,3 +84,47 @@
 }
 ```
 *`total_templates` 表示当前引擎在内存中维护的有效日志模板数量。*
+
+---
+
+## 4. 实时模板监控观测接口
+
+**接口描述**：【预训练阶段监控专用】用于在服务运行时（如初期连接 Kafka 消费大量数据时），实时观测当前的日志模板收敛情况。通过观察长尾模板，判断是否出现“模板爆炸”以及评估当前正则表达式的拦截有效性。
+
+**请求路径**：`GET /api/templates?limit={limit}`
+
+### 4.1 请求参数 (Query Parameters)
+
+| 字段名 | 类型  | 必填 | 默认值 | 描述                                       |
+| ------ | ----- | ---- | ------ | ------------------------------------------ |
+| `limit`| int   | 否   | 100    | 指定返回模板列表的最大条数。按命中次数倒序。|
+
+### 4.2 响应示例
+
+```json
+{
+  "total_clusters": 12,
+  "showing": 2,
+  "templates": [
+    {
+      "cluster_id": 1,
+      "size": 5230,
+      "template": "<THREAD> <CODE_LINE> com.apex.ygt.util.EsbUtil - queryFix Response=<JSON>"
+    },
+    {
+      "cluster_id": 2,
+      "size": 1,
+      "template": "<THREAD>[esb.adapter.hst2.plugin.param.Hst2PassPlugin]java.lang.NegativeArraySizeException:null"
+    }
+  ]
+}
+```
+
+* `total_clusters`: 当前引擎在内存中维护的模板总数。
+* `size`: 某个特定模板被历史日志命中的次数。
+* `template`: 被引擎正则表达式掩盖静态化之后的模板字符串。
+
+> **💡 观测与调优建议：**
+> 1. 重点观察 `total_clusters` 是否异常疯长（比如一直处于几万以上）。
+> 2. 定期关注那些 `size` 为 `1`（仅出现过一次）的末尾长尾模板。如果它们的 `template` 中包含未经掩码的随机乱码、杂凑哈希、随机的交易流水号等无规则变动串，这就说明现存的正则表达式不足以拦截该动态数据。
+> 3. 此时只需在 Python 代码 `config.masking_instructions` 中补充针对该“漏网之鱼”的正则表达式即可。

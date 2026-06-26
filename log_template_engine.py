@@ -57,6 +57,7 @@ class LogTemplateEngine:
         config = TemplateMinerConfig()
         config.masking_instructions = [
             # 1. 替换嵌套的 JSON 数据内容（如 Request={...}）
+            # 注：不使用 (?s) 跨行匹配，确保能够分别掩盖同行内或被静态信息分隔的多个 JSON 块
             RegexMaskingInstruction(r"\{.*\}", "<JSON>"),
             
             # 2. 替换重组后的时间戳头部 (e.g. [2026-06-24 14:23:55,560])
@@ -65,23 +66,27 @@ class LogTemplateEngine:
             # 3. 替换重组后的日志级别 (e.g. [ERROR])
             RegexMaskingInstruction(r"\[(ERROR|WARN|INFO|DEBUG|CRITICAL|FATAL|TRACE)\]", "<LEVEL>"),
             
-            # 4. 替换重组后的 IP (e.g. [172.19.35.4])
-            RegexMaskingInstruction(r"\[\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\]", "<IP>"),
+            # 4. 替换 IP 地址（包括带方括号和不带方括号的孤立 IP）
+            RegexMaskingInstruction(r"\[?\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b\]?", "<IP>"),
             
             # 5. 替换重组后的文件路径 (e.g. [/home/ygt/LiveBOS_Tomcat/logs/catalina.out])
             RegexMaskingInstruction(r"\[/.*?\]", "<PATH>"),
             
             # 以下针对 loginfo 内部的动态变量进行掩码
-            # 5. 替换线程名 (如 [http-8080-1])
+            # 6. 替换线程名或特定适配器标识 (如 [http-8080-1] 或 [CJOIIS])
             RegexMaskingInstruction(r"\[[a-zA-Z0-9\-]+\]", "<THREAD>"),
             
-            # 6. 替换 Java 类及行号 (如 (EsbUtil.java:157))
+            # 7. 替换 Java 类及行号 (如 (EsbUtil.java:157))
             RegexMaskingInstruction(r"\([\w]+\.java:\d+\)", "<CODE_LINE>"),
             
-            # 7. 替换 UUID
+            # 8. 替换标准 UUID
             RegexMaskingInstruction(r"\b[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}\b", "<UUID>"),
             
-            # 8. 兜底替换所有剩余的独立数字
+            # 9. 替换十六进制长字符串 (如 0x开头的内存地址，或长于10位的纯杂凑哈希、MAC地址等)
+            RegexMaskingInstruction(r"\b0x[a-fA-F0-9]+\b", "<HEX>"),
+            RegexMaskingInstruction(r"\b[a-fA-F0-9]{10,}\b", "<HEX>"),
+            
+            # 10. 兜底替换所有剩余的独立数字 (必须放最后)
             RegexMaskingInstruction(r"\b\d+\b", "<NUM>"),
         ]
 

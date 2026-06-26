@@ -68,9 +68,38 @@ async def match_log_template(req: MatchLogRequest):
 
 @app.get("/health")
 async def health_check():
-    """健康检查接口，附带返回当前模板总数"""
+    """健康检查与基础状态获取"""
     if engine_instance is None:
-        return {"status": "starting"}
+        raise HTTPException(status_code=503, detail="LogTemplateEngine 尚未初始化完成")
+    return {
+        "status": "ok",
+        "total_templates": engine_instance.get_template_count()
+    }
+
+@app.get("/api/templates")
+async def get_all_templates(limit: int = 100):
+    """
+    【预训练监控专用】实时观测当前的日志模板收敛情况
+    返回按命中次数(size)降序排列的模板列表。
+    """
+    if engine_instance is None:
+        raise HTTPException(status_code=503, detail="LogTemplateEngine 尚未初始化完成")
+        
+    clusters = engine_instance._template_miner.drain.clusters
     
-    count = engine_instance.get_template_count()
-    return {"status": "ok", "total_templates": count}
+    result = []
+    for cluster in clusters:
+        result.append({
+            "cluster_id": cluster.cluster_id,
+            "size": cluster.size, # 该模板命中了多少条日志
+            "template": cluster.get_template()
+        })
+        
+    # 按命中次数降序排列，优先看最高频的，以及那些 size 为 1 的长尾异常模板
+    result.sort(key=lambda x: x["size"], reverse=True)
+    
+    return {
+        "total_clusters": len(clusters),
+        "showing": min(limit, len(clusters)),
+        "templates": result[:limit]
+    }
