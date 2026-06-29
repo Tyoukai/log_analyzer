@@ -28,6 +28,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main")
 
+# 屏蔽 kafka-python 底层因为 CPU 抢占造成的网络轮询超时警告 (>= ERROR 才打印)
+logging.getLogger("kafka").setLevel(logging.ERROR)
+
 # 全局变量
 engine = None
 kafka_trainer = None

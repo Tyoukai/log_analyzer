@@ -2,6 +2,9 @@
 
 恢复命令：agy --conversation=396b9e0b-dd73-41c0-937a-3831ae74df21
 
+使用pex进行打包。在pycharm的终端打包即可。打包命令为：pex --sources-directory . -r requirements.txt -e main:main --python=python3.11 --platform=manylinux2014_x86_64-cp-311-cp311 -o log_analyzer.pex
+log_analyzer.pex。打完包后，copy到linux上，使用 python log_analyzer.pex命令即可运行。
+
 本文档包含如何将该 Python 日志分析引擎转移到 Linux 环境下进行部署、配置、启动以及接口测试的完整流程。
 
 ## 1. 转移与解压
