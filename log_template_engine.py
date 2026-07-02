@@ -12,7 +12,10 @@ import hashlib
 import json
 import logging
 import os
+import re
 import threading
+import time
+from logging.handlers import TimedRotatingFileHandler
 
 from drain3 import TemplateMiner
 from drain3.file_persistence import FilePersistence
@@ -55,38 +58,29 @@ class LogTemplateEngine:
         # 参照 logparser_demo.py 中的规则
         # ------------------------------------------------------------------
         config = TemplateMinerConfig()
+        
+        # --- 针对大掌柜过拟合问题的深度优化配置 ---
+        config.drain_depth = 8     # 拔高路由深度，穿透静态前缀
+        config.drain_sim_th = 0.85 # 收紧相似度阈值，避免 Request/Response 被误合并
+        
         config.masking_instructions = [
-            # 1. 替换嵌套的 JSON 数据内容（如 Request={...}）
-            # 注：不使用 (?s) 跨行匹配，确保能够分别掩盖同行内或被静态信息分隔的多个 JSON 块
+            # 1. 替换嵌套的 JSON 数据内容
             RegexMaskingInstruction(r"\{.*\}", "<JSON>"),
             
-            # 2. 替换重组后的时间戳头部 (e.g. [2026-06-24 14:23:55,560])
-            RegexMaskingInstruction(r"^\[\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}[,\.]?\d*\]", "<TIMESTAMP>"),
-            
-            # 3. 替换重组后的日志级别 (e.g. [ERROR])
-            RegexMaskingInstruction(r"\[(ERROR|WARN|INFO|DEBUG|CRITICAL|FATAL|TRACE)\]", "<LEVEL>"),
-            
-            # 4. 替换 IP 地址（包括带方括号和不带方括号的孤立 IP）
-            RegexMaskingInstruction(r"\[?\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b\]?", "<IP>"),
-            
-            # 5. 替换重组后的文件路径 (e.g. [/home/ygt/LiveBOS_Tomcat/logs/catalina.out])
-            RegexMaskingInstruction(r"\[/.*?\]", "<PATH>"),
-            
-            # 以下针对 loginfo 内部的动态变量进行掩码
-            # 6. 替换线程名或特定适配器标识 (如 [http-8080-1] 或 [CJOIIS])
+            # 2. 替换线程名或特定适配器标识 (如 [http-8080-1] 或 [CJOIIS])
             RegexMaskingInstruction(r"\[[a-zA-Z0-9\-]+\]", "<THREAD>"),
             
-            # 7. 替换 Java 类及行号 (如 (EsbUtil.java:157))
+            # 3. 替换 Java 类及行号 (如 (EsbUtil.java:157))
             RegexMaskingInstruction(r"\([\w]+\.java:\d+\)", "<CODE_LINE>"),
             
-            # 8. 替换标准 UUID
+            # 4. 替换标准 UUID
             RegexMaskingInstruction(r"\b[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}\b", "<UUID>"),
             
-            # 9. 替换十六进制长字符串 (如 0x开头的内存地址，或长于10位的纯杂凑哈希、MAC地址等)
+            # 5. 替换十六进制长字符串
             RegexMaskingInstruction(r"\b0x[a-fA-F0-9]+\b", "<HEX>"),
             RegexMaskingInstruction(r"\b[a-fA-F0-9]{10,}\b", "<HEX>"),
             
-            # 10. 兜底替换所有剩余的独立数字 (必须放最后)
+            # 6. 兜底替换所有剩余的独立数字 (必须放最后)
             RegexMaskingInstruction(r"\b\d+\b", "<NUM>"),
         ]
 
@@ -103,8 +97,44 @@ class LogTemplateEngine:
             "LogTemplateEngine 初始化完成，当前已有模板数量: %d", template_count
         )
 
-    def preprocess_log(self, raw_log: str) -> str:
-        """解析 JSON 日志，校验必填要素并重组文本"""
+        # ------------------------------------------------------------------
+        # F5 - 错误日志收集功能 (上线后一周内)
+        # ------------------------------------------------------------------
+        self.backup_dir = os.path.join(os.getcwd(), "error_logs_backup")
+        os.makedirs(self.backup_dir, exist_ok=True)
+        
+        # 使用持久化文件记录项目的首次启动时间，防止服务重启导致时间重置
+        first_start_file = os.path.join(self.backup_dir, ".first_start_time")
+        if os.path.exists(first_start_file):
+            with open(first_start_file, "r") as f:
+                try:
+                    self.project_start_time = float(f.read().strip())
+                except ValueError:
+                    self.project_start_time = time.time()
+        else:
+            self.project_start_time = time.time()
+            with open(first_start_file, "w") as f:
+                f.write(str(self.project_start_time))
+                
+        # 初始化备份专用 logger
+        self.backup_logger = logging.getLogger("ErrorLogBackup")
+        self.backup_logger.setLevel(logging.INFO)
+        self.backup_logger.propagate = False
+        
+        # 每天切分一个文件，不设置 backupCount 以永久保留收集到的首周数据
+        fh = TimedRotatingFileHandler(
+            os.path.join(self.backup_dir, "raw_error.jsonl"),
+            when="midnight",
+            interval=1,
+            backupCount=0,
+            encoding="utf-8"
+        )
+        fh.setFormatter(logging.Formatter("%(message)s"))
+        if not self.backup_logger.handlers:
+            self.backup_logger.addHandler(fh)
+
+    def preprocess_log(self, raw_log: str):
+        """解析 JSON 日志，校验必填要素并分离静态头与业务内容"""
         try:
             log_dict = json.loads(raw_log)
         except json.JSONDecodeError:
@@ -141,10 +171,33 @@ class LogTemplateEngine:
         if missing_fields:
             raise ValueError(f"缺乏日志要素: 缺少以下必须字段 {', '.join(missing_fields)}")
                 
-        # 3. 将其余所有无用信息丢弃，重组为干净的结构化纯文本
-        # 格式如：[2026-06-24 14:23:55,560] [ERROR] [172.19.35.4] [/home/ygt/catalina.out] [http-8080-1] ...
-        clean_log = f"[{timestamp}] [{log_level}] [{source_ip}] [{path}] {loginfo}"
-        return clean_log
+        # 3. 智能提取 loginfo 内部的 JSON 业务字段，避免暴力的 <JSON> 掩码吞噬业务差异性
+        match = re.search(r"(\{.*\})", loginfo)
+        if match:
+            json_str = match.group(1)
+            try:
+                payload = json.loads(json_str)
+                extracted = []
+                if "func" in payload:
+                    extracted.append(f"func={payload['func']}")
+                if "fldm" in payload:
+                    extracted.append(f"fldm={payload['fldm']}")
+                if "code" in payload:
+                    extracted.append(f"code={payload['code']}")
+                if "note" in payload:
+                    extracted.append(f"note={payload['note']}")
+                
+                if extracted:
+                    meta = "[" + ", ".join(extracted) + "]"
+                    loginfo = loginfo[:match.start()] + meta + " <JSON>" + loginfo[match.end():]
+                else:
+                    loginfo = loginfo[:match.start()] + "<JSON>" + loginfo[match.end():]
+            except Exception:
+                # 解析失败则回退为通用的 <JSON> 掩码
+                loginfo = loginfo[:match.start()] + "<JSON>" + loginfo[match.end():]
+                
+        # 彻底抛弃冗余的 IP、时间等固定头部，直接返回纯正的业务 loginfo 进行聚类
+        return loginfo
 
     def match_template(self, raw_log: str, timestamp: int) -> dict:
         """对一条原始日志进行模板匹配/提取
@@ -166,20 +219,24 @@ class LogTemplateEngine:
             }
         """
         # 预处理与强校验
-        processed_log = self.preprocess_log(raw_log)
+        clean_loginfo = self.preprocess_log(raw_log)
+
+        # 备份功能：仅在项目首次启动后的一周内（7 * 24 * 3600 秒）收集数据
+        if time.time() - self.project_start_time <= 604800:
+            # 过滤掉换行符，保证输出为标准的一行一个 JSON 的 JSONL 格式
+            clean_raw = raw_log.strip().replace("\n", " ").replace("\r", " ")
+            self.backup_logger.info(clean_raw)
 
         with self._lock:
-            # Drain3 的 add_log_message 同时完成"匹配 + 训练"：
-            #   - 如果匹配到已有模板，返回该模板信息
-            #   - 如果未匹配，自动提取新模板，更新解析树，
-            #     并通过 FilePersistenceHandler 将最新状态同步到本地文件
-            result = self._template_miner.add_log_message(processed_log)
+            # Drain3 的 add_log_message 只接收干净的 loginfo 核心文本：
+            # 这样算法能将所有的前缀树深度用于区分实际的报错特征
+            result = self._template_miner.add_log_message(clean_loginfo)
 
         # 判断是否为新模板
         change_type = result.get("change_type")
         is_new = change_type == "cluster_created"
 
-        # 获取模板内容
+        # 获取完全由纯业务 loginfo 组成的极简模板内容
         cluster = result["cluster_id"]
         template_mined = result["template_mined"]
 
