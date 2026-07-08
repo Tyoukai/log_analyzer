@@ -14,8 +14,6 @@ import logging
 import os
 import re
 import threading
-import time
-from logging.handlers import TimedRotatingFileHandler
 
 from drain3 import TemplateMiner
 from drain3.file_persistence import FilePersistence
@@ -98,40 +96,48 @@ class LogTemplateEngine:
         )
 
         # ------------------------------------------------------------------
-        # F5 - 错误日志收集功能 (上线后一周内)
+        # F5 - WARN / INFO 日志分级收集功能
+        # 收集非 ERROR 级别的日志作为后续分析的源数据
+        # 终止条件：每个文件超过 1GB 后自动停止写入
         # ------------------------------------------------------------------
-        self.backup_dir = os.path.join(os.getcwd(), "error_logs_backup")
-        os.makedirs(self.backup_dir, exist_ok=True)
+        self._collect_dir = os.path.join(os.getcwd(), "collected_logs")
+        os.makedirs(self._collect_dir, exist_ok=True)
         
-        # 使用持久化文件记录项目的首次启动时间，防止服务重启导致时间重置
-        first_start_file = os.path.join(self.backup_dir, ".first_start_time")
-        if os.path.exists(first_start_file):
-            with open(first_start_file, "r") as f:
-                try:
-                    self.project_start_time = float(f.read().strip())
-                except ValueError:
-                    self.project_start_time = time.time()
-        else:
-            self.project_start_time = time.time()
-            with open(first_start_file, "w") as f:
-                f.write(str(self.project_start_time))
-                
-        # 初始化备份专用 logger
-        self.backup_logger = logging.getLogger("ErrorLogBackup")
-        self.backup_logger.setLevel(logging.INFO)
-        self.backup_logger.propagate = False
+        self._collect_files = {
+            "WARN": os.path.join(self._collect_dir, "warn_logs.jsonl"),
+            "INFO": os.path.join(self._collect_dir, "info_logs.jsonl"),
+        }
+        # 1GB = 1073741824 bytes
+        self._collect_max_bytes = 1073741824
+        # 写入锁，防止多线程并发写文件时产生交错
+        self._collect_lock = threading.Lock()
+
+    def _collect_log(self, raw_log: str):
+        """收集 WARN / INFO 级别的日志到本地文件
         
-        # 每天切分一个文件，不设置 backupCount 以永久保留收集到的首周数据
-        fh = TimedRotatingFileHandler(
-            os.path.join(self.backup_dir, "raw_error.jsonl"),
-            when="midnight",
-            interval=1,
-            backupCount=0,
-            encoding="utf-8"
-        )
-        fh.setFormatter(logging.Formatter("%(message)s"))
-        if not self.backup_logger.handlers:
-            self.backup_logger.addHandler(fh)
+        在 match_template 最前面调用，在 preprocess_log 校验之前拦截。
+        当目标文件已达 1GB 上限时自动跳过写入。
+        """
+        try:
+            log_dict = json.loads(raw_log)
+        except (json.JSONDecodeError, TypeError):
+            return
+            
+        log_level = log_dict.get("log_level", "")
+        if log_level not in self._collect_files:
+            return
+            
+        target_file = self._collect_files[log_level]
+        
+        with self._collect_lock:
+            # 检查文件大小是否已达上限
+            if os.path.exists(target_file) and os.path.getsize(target_file) >= self._collect_max_bytes:
+                return
+            
+            # 写入一行标准的 JSONL
+            clean_raw = raw_log.strip().replace("\n", " ").replace("\r", " ")
+            with open(target_file, "a", encoding="utf-8") as f:
+                f.write(clean_raw + "\n")
 
     def preprocess_log(self, raw_log: str):
         """解析 JSON 日志，校验必填要素并分离静态头与业务内容"""
@@ -218,14 +224,11 @@ class LogTemplateEngine:
                 "template_content": str,   # 静态模板内容
             }
         """
-        # 预处理与强校验
-        clean_loginfo = self.preprocess_log(raw_log)
+        # 在预处理之前先尝试收集 WARN / INFO 日志（不影响主流程）
+        self._collect_log(raw_log)
 
-        # 备份功能：仅在项目首次启动后的一周内（7 * 24 * 3600 秒）收集数据
-        if time.time() - self.project_start_time <= 604800:
-            # 过滤掉换行符，保证输出为标准的一行一个 JSON 的 JSONL 格式
-            clean_raw = raw_log.strip().replace("\n", " ").replace("\r", " ")
-            self.backup_logger.info(clean_raw)
+        # 预处理与强校验（非 ERROR 级别的日志会在这里被 ValueError 拦截）
+        clean_loginfo = self.preprocess_log(raw_log)
 
         with self._lock:
             # Drain3 的 add_log_message 只接收干净的 loginfo 核心文本：
