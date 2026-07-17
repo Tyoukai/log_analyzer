@@ -55,33 +55,38 @@ class LogTemplateEngine:
         # ------------------------------------------------------------------
         # F1 - 配置正则表达式掩码规则
         # 鉴于大掌柜系统日志格式极不规范，必须在聚类之前进行高强度掩码处理
-        # 参照 logparser_demo.py 中的规则
         # ------------------------------------------------------------------
         config = TemplateMinerConfig()
         
-        # --- 针对大掌柜过拟合问题的深度优化配置 ---
-        config.drain_depth = 8     # 拔高路由深度，穿透静态前缀
-        config.drain_sim_th = 0.85 # 收紧相似度阈值，避免 Request/Response 被误合并
+        # --- 基于 80 万条线上真实数据的网格搜索最优参数 ---
+        # depth=4: 浅层路由即可，因为 queryFix 已在预处理阶段统一掩码，
+        #          剩余的 1925 条非 queryFix 日志无需深层前缀区分
+        # sim_th=0.5: 0.50→0.52 存在断崖式过拟合跳变（12→74 聚类），
+        #             0.5 是保证合理聚类的最高安全阈值
+        config.drain_depth = 4
+        config.drain_sim_th = 0.5
         
         config.masking_instructions = [
-            # 1. 替换嵌套的 JSON 数据内容
-            RegexMaskingInstruction(r"\{.*\}", "<JSON>"),
+            # 1. 掩码 fdFileName 的文件名值（中文文件名每次都不同，对聚类无意义）
+            RegexMaskingInstruction(r"fdFileName:[^,]+", "FD_FILE"),
             
-            # 2. 替换线程名或特定适配器标识 (如 [http-8080-1] 或 [CJOIIS])
-            RegexMaskingInstruction(r"\[[a-zA-Z0-9\-]+\]", "<THREAD>"),
+            # 2. 精确掩码线程名（必须包含 "-数字" 后缀，如 [qtp960552339-110]、[http-nio-8080-exec-3]）
+            #    保留类名 [com.apex.util.cif] 和系统标识 [CJOIIS] 不做掩码，
+            #    使 drain3 能根据来源生成可读模板
+            RegexMaskingInstruction(r"\[[\w.]+-\d+\]", "THREAD"),
             
             # 3. 替换 Java 类及行号 (如 (EsbUtil.java:157))
-            RegexMaskingInstruction(r"\([\w]+\.java:\d+\)", "<CODE_LINE>"),
+            RegexMaskingInstruction(r"\([\w]+\.java:\d+\)", "CODE_LINE"),
             
             # 4. 替换标准 UUID
-            RegexMaskingInstruction(r"\b[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}\b", "<UUID>"),
+            RegexMaskingInstruction(r"\b[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}\b", "UUID"),
             
             # 5. 替换十六进制长字符串
-            RegexMaskingInstruction(r"\b0x[a-fA-F0-9]+\b", "<HEX>"),
-            RegexMaskingInstruction(r"\b[a-fA-F0-9]{10,}\b", "<HEX>"),
+            RegexMaskingInstruction(r"\b0x[a-fA-F0-9]+\b", "HEX"),
+            RegexMaskingInstruction(r"\b[a-fA-F0-9]{10,}\b", "HEX"),
             
             # 6. 兜底替换所有剩余的独立数字 (必须放最后)
-            RegexMaskingInstruction(r"\b\d+\b", "<NUM>"),
+            RegexMaskingInstruction(r"\b\d+\b", "NUM"),
         ]
 
         # ------------------------------------------------------------------
@@ -171,7 +176,20 @@ class LogTemplateEngine:
         if missing_fields:
             raise ValueError(f"缺乏日志要素: 缺少以下必须字段 {', '.join(missing_fields)}")
                 
-        # 3. 智能提取 loginfo 内部的 JSON 业务字段，避免暴力的 <JSON> 掩码吞噬业务差异性
+        # 3. queryFix 统一掩码（最高优先级）
+        # EsbUtil 的 queryFix Request/Response 占线上 ERROR 日志的 99.8%，
+        # 其 JSON 载荷内容每次请求都不同，对错误分类毫无意义。
+        # 将 Request 和 Response 统一合并为 <ESB_PAYLOAD>，使它们归入同一个模板。
+        # 使用 [\s\S]* 替代 .* 以匹配含换行符的多行日志（线上约 4% 的 queryFix 含 \n）
+        if "queryFix Request=" in loginfo or "queryFix Response=" in loginfo:
+            loginfo = re.sub(
+                r"(queryFix\s+)(?:Request|Response)(\s*=\s*)\{[\s\S]*",
+                r"\1<ESB_PAYLOAD>",
+                loginfo
+            )
+            return loginfo
+                
+        # 4. 智能提取 loginfo 内部的 JSON 业务字段，避免暴力的 <JSON> 掩码吞噬业务差异性
         match = re.search(r"(\{.*\})", loginfo)
         if match:
             json_str = match.group(1)
@@ -195,6 +213,24 @@ class LogTemplateEngine:
             except Exception:
                 # 解析失败则回退为通用的 <JSON> 掩码
                 loginfo = loginfo[:match.start()] + "<JSON>" + loginfo[match.end():]
+                
+        # 5. Java 堆栈跟踪剥离
+        # 堆栈帧的区分度远低于异常类名 + 错误消息：
+        #   - 同一个 SQLSyntaxErrorException 可能从不同代码路径抛出（不同堆栈）
+        #   - 同一个 NullPointerException 在不同请求中帧数不同（20帧 vs 60帧）
+        # 保留堆栈帧会导致 drain3 将本质相同的错误拆分为多个聚类。
+        # 因此只保留异常消息，用 <STACK> 标记堆栈已被剥离。
+        
+        # 5a. 标准格式：支持 " at Class(" 或 "\n    at Class(" 等任意空白前缀
+        loginfo = re.sub(r"\s+at [\w.$]+\(", " <STACK>", loginfo, count=1)
+        
+        # 5b. 非标准格式：部分系统省略了 "at" 关键字，直接输出 "包名.类名.方法(文件名.java:行号)"
+        #     仅在标准格式未匹配时执行，避免误伤
+        if "<STACK>" not in loginfo:
+            loginfo = re.sub(r"\n[\w.$]+\([\w]+\.java:\d+\)", " <STACK>", loginfo, count=1)
+        
+        if "<STACK>" in loginfo:
+            loginfo = loginfo[:loginfo.index("<STACK>") + len("<STACK>")]
                 
         # 彻底抛弃冗余的 IP、时间等固定头部，直接返回纯正的业务 loginfo 进行聚类
         return loginfo
